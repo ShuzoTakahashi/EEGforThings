@@ -2,11 +2,9 @@ package com.example.shuzotakahashi.eegforthings
 
 
 import android.app.Activity
-import android.app.Service
 import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
-import android.util.Log
 import android.widget.Toast
 import com.choosemuse.libmuse.*
 import com.choosemuse.libmuse.MuseDataPacketType.*
@@ -16,13 +14,6 @@ import com.github.mikephil.charting.data.LineDataSet
 import com.google.android.things.pio.PeripheralManagerService
 import kotlinx.android.synthetic.main.activity_main.*
 import java.util.*
-import kotlin.collections.LinkedHashMap
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothProfile
-import android.content.Intent
-import android.os.DeadObjectException
-import com.google.android.things.bluetooth.BluetoothProfileManager
-import kotlin.math.log
 
 
 // 脳波センサから送られてきた値を格納するMapを用意する。
@@ -41,37 +32,51 @@ private val hasEegData: HashMap<MuseDataPacketType, Boolean> = hashMapOf(
 // 集中していない状態に陥ったときの現在時刻
 private var startTime: Long = 0
 
-private val chartMap = linkedMapOf(
-        "alpha" to Color.parseColor("#F44336"),
-        "beta" to Color.parseColor("#FF9800"),
-        "delta" to Color.parseColor("#00BCD4"),
-        "theta" to Color.parseColor("#2196F3"))
-
 class MainActivity : Activity() {
 
-    private val TAG = MainActivity::class.java.simpleName
-    private val handler = Handler()
-    private val dataListener = DateListener()
     private val museManager = MuseManagerAndroid.getInstance()
-    // private val chart = findViewById<LineChart>(R.id.lineChart)
+    private val dataListener = DateListener()
+    private val handler = Handler()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        setActionBar(toolbar)
 
+        museManager.setContext(this)
 
-        /* デバッグ用
-           val mBluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
-           val isBtEnable = mBluetoothAdapter.isMuseEnabled
+        // fabを押したら、周囲からヘッドセットを探して、接続を開始します。
+        // その時受信する脳波の種類やデータを決めます(反応するリスナを決める) 。
+        fab.setOnClickListener {
+            museManager.stopListening()
 
-           val btProfile = BluetoothProfileManager()
-           val enbaleList = btProfile.enabledProfiles
-           val toEnable = listOf(BluetoothProfile.GATT)
-           btProfile.enableProfiles(toEnable)*/
+            val museList = museManager.muses//周囲にあるヘッドバンドのリストを取得する
+            if (museList.size >= 1) {
+                val muse = museList[0]
+                muse.unregisterAllListeners() //以前登録されたリスナをすべて解除
+                muse.registerDataListener(dataListener, ALPHA_ABSOLUTE) // α波
+                muse.registerDataListener(dataListener, BETA_ABSOLUTE) // β波
+                muse.registerDataListener(dataListener, DELTA_ABSOLUTE) // δ波
+                muse.registerDataListener(dataListener, THETA_ABSOLUTE) //θ波
 
+                muse.runAsynchronously()// ヘッドバンドとの接続を開始し、データを非同期でストリーミングする。
+                Toast.makeText(this, "successfully", Toast.LENGTH_LONG).show()
+            } else {
+                //周りに一つもヘッドセットが存在しない時
+                Toast.makeText(this, "Headset is not found around", Toast.LENGTH_LONG).show()
+            }
+        }
 
+        // グラフをセットアップする
         chart.setDescription("") // グラフのタイトル。今回は空。
         chart.data = LineData() // 空のLineDataインスタンスを追加
+
+        // グラフのラベルと色のマップ
+        val chartMap = linkedMapOf(
+                "alpha" to Color.parseColor("#F44336"),
+                "beta" to Color.parseColor("#FF9800"),
+                "delta" to Color.parseColor("#00BCD4"),
+                "theta" to Color.parseColor("#2196F3"))
 
         for (label in chartMap.keys) {
             val line = LineDataSet(null, label) // 新しく折れ線グラフを生成
@@ -83,70 +88,53 @@ class MainActivity : Activity() {
             chart.lineData.addDataSet(line) // 折れ線グラフを追加する
         }
 
-        museManager.setContext(this)
+    }
 
-        button.setOnClickListener {
-            museManager.stopListening()
-
-            val museList = museManager.muses//周囲にあるヘッドバンドのリストを取得する
-            if (museList.size >= 1) {
-                val muse = museList[0]
-                muse.unregisterAllListeners() //以前登録されたリスナーをすべて解除
-                muse.registerDataListener(dataListener, ALPHA_ABSOLUTE)
-                muse.registerDataListener(dataListener, BETA_ABSOLUTE)
-                muse.registerDataListener(dataListener, DELTA_ABSOLUTE)
-                muse.registerDataListener(dataListener, THETA_ABSOLUTE)
-
-                muse.runAsynchronously()// ヘッドバンドへの接続を開始し、データを非同期でストリーミングする。
-                Toast.makeText(this, "successfully", Toast.LENGTH_LONG).show()
-            } else {
-                //周りに一つもヘッドセットが存在しない時
-                Toast.makeText(this, "Headset is not found around", Toast.LENGTH_LONG).show()
-            }
-        }
-
-        try {
-            // postはLooperのキューにRunnableを追加する
-            handler.post(tickUI)
-        }catch (e : DeadObjectException){
-            Log.d(TAG," DeadObjectException発生")
-        }
+    override fun onStart() {
 
         museManager.startListening()
+        //　LooperのキューにRunnableを追加する
+        handler.post(tickUI)
+
+        super.onStart()
     }
 
 
     override fun onDestroy() {
-        super.onDestroy()
         museManager.stopListening()
+        super.onDestroy()
     }
 
     private val tickUI: Runnable = object : Runnable {
 
         override fun run() {
 
-            val eegValueMap = hashMapOf<MuseDataPacketType, Double>() //取得した脳波の値を保持する
+            //取得した脳波の値を保持する
+            val eegValueMap = hashMapOf<MuseDataPacketType, Double>()
             val data = chart.lineData
 
+            // 各脳波（α波、β波、θ波、δ波 ）のバッファーには（左耳、左額、右額、右頬）の4つのセンサの値が格納されている。
+            // その4つの値を統合して一つの値にし、グラフに渡して描写していく。
             for ((index, eegType) in arrayOf(ALPHA_ABSOLUTE, BETA_ABSOLUTE, DELTA_ABSOLUTE, THETA_ABSOLUTE).withIndex()) {
+                // 脳波の値はバッファーに格納してあるか？
                 if (hasEegData.getValue(eegType)) {
+                    // 統合した値を格納する変数を用意。
+                    // それぞれ値を100倍して、すべて足す。
+                    // それを4で割った値を統合した値とする。
                     var eegValue = 0.0
                     eegBufferMap.getValue(eegType).filterNotNull()
                             .forEach { eegValue = it * 100 }
                     eegValue /= 4
                     eegValueMap.put(eegType, eegValue)
 
-                    // Log.d(eegType.toString(),eegValue.toString())
-
-                    //グラフの描写処理
+                    //グラフに値をセットする
                     val line = data.getDataSetByIndex(index)
                     data.addEntry(Entry(line.entryCount.toFloat(), eegValue.toFloat()), index)
                     data.notifyDataChanged()
-
-
                 }
             }
 
+            // すべての脳波のデータがちゃんと受信された状態か？
             if (hasEegData.getValue(ALPHA_ABSOLUTE) && hasEegData.getValue(BETA_ABSOLUTE)
                     && hasEegData.getValue(THETA_ABSOLUTE) && hasEegData.getValue(DELTA_ABSOLUTE)) {
 
@@ -155,35 +143,43 @@ class MainActivity : Activity() {
                 chart.setVisibleXRangeMaximum(50.toFloat())
                 chart.moveViewToX(data.entryCount.toFloat())
 
-                //　集中している状態ならカウンタを初期化する
+                //　眠い状態か？
                 if ((eegValueMap.getValue(ALPHA_ABSOLUTE) + eegValueMap.getValue(BETA_ABSOLUTE))
-                        > (eegValueMap.getValue(DELTA_ABSOLUTE) + eegValueMap.getValue(THETA_ABSOLUTE))) {
+                        < (eegValueMap.getValue(DELTA_ABSOLUTE) + eegValueMap.getValue(THETA_ABSOLUTE))) {
 
-                    startTime = 0
+                    // 眠い状態なら
+                    // 状態を示すTextViewの値を更新する
+                    awakeningStatus.text = "Sleepy"
+                    awakeningStatus.setTextColor(Color.parseColor("#F44336"))
 
-                } else {
-
-                    concentrateStatus.text = "NO"
-
-                    //初めて集中していない状態に陥ったとき、その時の現在時刻を取得する
+                    //　初めて（もしくは再び）眠い状態に陥ったとき、現在時刻を取得する
                     if (startTime == 0.toLong()) {
                         startTime = System.currentTimeMillis()
                     }
 
-                    // 5秒間集中していない状態が続いたら、
+
+                    // 5秒間眠い状態が状態が続いたら、部屋の照明を消す。
                     if (System.currentTimeMillis() - startTime > 5000) {
 
-
-                        /*
-                        // TODO: サーボモータの動作処理のテストが必要
+                        // 部屋の照明を消す処理
                         val service = PeripheralManagerService()
                         val pwm = service.openPwm("PWM0")
                         pwm.setPwmFrequencyHz(50.0) // 周波数を50Hzに
-                        // 使用するSG92Rはだいたい 0.7ms〜2msのパルス幅で角度を指定する
-                        // PWMの周期が20ms(つまり50HZ)のとき、3.5%〜10% 程度が指定するデューティ比となる
-                        pwm.setPwmDutyCycle(1.35) //中心
-                        pwm.setEnabled(true)*/
+                        pwm.setPwmDutyCycle(6.1) // 70°動かす
+                        pwm.setEnabled(true)
+                        onDestroy()
+
                     }
+
+                } else {
+                    //眠くなくて覚醒状態のとき
+
+                    // 状態を示すTextViewの値を更新する
+                    awakeningStatus.text = "Awakening"
+                    awakeningStatus.setTextColor(Color.parseColor("#76c13a"))
+
+                    // 眠くなった時刻を保持する変数を0にする
+                    startTime = 0
                 }
             }
 
@@ -191,27 +187,24 @@ class MainActivity : Activity() {
             handler.postDelayed(this, 1000 / 60)
         }
     }
+
 }
 
 
 class DateListener : MuseDataListener() {
-
-    //TODO: 無理やり引数からnullableを消したけど、大丈夫？
+    //データを受信するときに利用するリスナー
     override fun receiveMuseDataPacket(p0: MuseDataPacket, p1: Muse) {
-
         val eegType = p0.packetType()
         val eegBuffer = eegBufferMap.getValue(eegType)
         for (i in 0..3) {
             // EEG1(左耳), EEG2(左額), EEG3(右額), EEG4(右耳)の値をバッファーの0-3に格納する
             // Eeg(enum)をvaluesメソッドで頭から順に格納した配列に変換している
             eegBuffer[i] = p0.getEegChannelValue(Eeg.values()[i])
-            Log.d(eegType.toString(), p0.getEegChannelValue(Eeg.values()[i]).toString())
         }
-        hasEegData.put(eegType, true)
+        hasEegData[eegType] = true
     }
 
     // ヘッドセットが外された、目の瞬き...などが検出されたときに呼び出される。今回は実装なし。
     override fun receiveMuseArtifactPacket(p0: MuseArtifactPacket, p1: Muse) {}
-
 }
 
